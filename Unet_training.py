@@ -1,12 +1,8 @@
 import os
-import json
-from collections import defaultdict
-
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ['SM_FRAMEWORK'] = 'tf.keras'
 
 import cv2
-from PIL import Image, ImageDraw
 from tensorflow import keras
 import numpy as np
 import matplotlib.pyplot as plt
@@ -43,20 +39,20 @@ DATA_DIR = r"E:\8_praca_magisterska\mtp_ferrule_images\labeled_images\07_07_2023
 test_bool = False
 
 # imsize = 512
-imsize = 2048
+imsize = 768
 # imsize = 384
 # imsize = 192
 # imsize = 960
 # imsize = 1600
 
 x_train_dir = os.path.join(DATA_DIR, 'train/images')
-y_train_annotations = os.path.join(DATA_DIR, 'train/annotations.json')
+y_train_dir = os.path.join(DATA_DIR, 'train/labels')
 
 x_valid_dir = os.path.join(DATA_DIR, 'val/images')
-y_valid_annotations = os.path.join(DATA_DIR, 'val/annotations.json')
+y_valid_dir = os.path.join(DATA_DIR, 'val/labels')
 
 x_test_dir = os.path.join(DATA_DIR, 'val/images')
-y_test_annotations = os.path.join(DATA_DIR, 'val/annotations.json')
+y_test_dir = os.path.join(DATA_DIR, 'val/labels')
 
 # x_test_dir = r"C:\Users\pawlowskj\Desktop\test"
 # y_test_dir = r"C:\Users\pawlowskj\Desktop\test"
@@ -110,61 +106,18 @@ class Dataset:
     def __init__(
             self,
             images_dir,
-            masks_dir=None,
+            masks_dir,
             classes=None,
             augmentation=None,
             preprocessing=None,
-            multiplier=1,
-            annotations_file=None,
+            multiplier=1
     ):
-        if annotations_file:
-            with open(annotations_file, 'r') as f:
-                coco_data = json.load(f)
+        self.ids = os.listdir(images_dir)
+        self.images_fps = [os.path.join(images_dir, image_id) for image_id in self.ids]
+        self.masks_fps = [os.path.join(masks_dir, image_id) for image_id in self.ids]
 
-            self._use_coco = True
-            self.images_dir = images_dir
-            self.image_id_to_info = {image['id']: image for image in coco_data.get('images', [])}
-            existing_ids = []
-            image_name_to_id = {}
-            for image in coco_data.get('images', []):
-                file_name = image['file_name']
-                if os.path.exists(os.path.join(images_dir, file_name)):
-                    existing_ids.append(file_name)
-                    image_name_to_id[file_name] = image['id']
-            # keep only images that actually exist on disk
-            self.ids = existing_ids
-            self.image_name_to_id = image_name_to_id
-
-            annotations_map = defaultdict(list)
-            for annotation in coco_data.get('annotations', []):
-                annotations_map[annotation['image_id']].append(annotation)
-            self.annotations = annotations_map
-
-            category_name_to_id = {category['name'].lower(): category['id']
-                                   for category in coco_data.get('categories', [])}
-            try:
-                self.class_values = [category_name_to_id[cls.lower()] for cls in classes]
-            except KeyError as exc:
-                missing = {cls for cls in classes if cls.lower() not in category_name_to_id}
-                raise ValueError(f"Missing categories in annotations file: {missing}") from exc
-            self.class_id_to_index = {class_id: index for index, class_id in enumerate(self.class_values)}
-
-            self.images_fps = [os.path.join(images_dir, image_id) for image_id in self.ids]
-            self.masks_fps = None
-        else:
-            if masks_dir is None:
-                raise ValueError("masks_dir must be provided when annotations_file is not set")
-            self._use_coco = False
-            self.ids = os.listdir(images_dir)
-            self.images_fps = [os.path.join(images_dir, image_id) for image_id in self.ids]
-            self.masks_fps = [os.path.join(masks_dir, image_id) for image_id in self.ids]
-
-            # convert str names to class values on masks
-            try:
-                self.class_values = [self.CLASSES.index(cls.lower()) for cls in classes]
-            except ValueError as exc:
-                missing = {cls for cls in classes if cls.lower() not in self.CLASSES}
-                raise ValueError(f"Unknown classes provided: {missing}") from exc
+        # convert str names to class values on masks
+        self.class_values = [self.CLASSES.index(cls.lower()) for cls in classes]
 
         self.augmentation = augmentation
         self.preprocessing = preprocessing
@@ -210,20 +163,15 @@ class Dataset:
         # read data
         image = cv2.imread(self.images_fps[index], 1)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        mask = cv2.imread(self.masks_fps[index], 0)
 
-        if self._use_coco:
-            mask = self._load_coco_mask(self.image_name_to_id[self.ids[index]], image.shape[0], image.shape[1])
-        else:
-            mask = cv2.imread(self.masks_fps[index], 0)
-
-            # extract certain classes from mask (e.g. cars)
-            masks = [(mask == v) for v in self.class_values]
-            mask = np.stack(masks, axis=-1).astype('float')
+        # extract certain classes from mask (e.g. cars)
+        masks = [(mask == v) for v in self.class_values]
+        mask = np.stack(masks, axis=-1).astype('float')
 
         # add background if mask is not binary
         if mask.shape[-1] != 1:
             background = 1 - mask.sum(axis=-1, keepdims=True)
-            background = np.clip(background, 0, 1)
             mask = np.concatenate((mask, background), axis=-1)
 
         # apply augmentations if it's an augmented instance
@@ -240,76 +188,6 @@ class Dataset:
 
     def __len__(self):
         return len(self.ids) * self.multiplier
-
-    def _load_coco_mask(self, image_id, height, width):
-        mask = np.zeros((height, width, len(self.class_values)), dtype='float32')
-        for annotation in self.annotations.get(image_id, []):
-            class_index = self.class_id_to_index.get(annotation['category_id'])
-            if class_index is None:
-                continue
-
-            segmentation = annotation.get('segmentation', [])
-            rle_mask = None
-            if isinstance(segmentation, list):
-                pil_mask = Image.new('L', (width, height), 0)
-                draw = ImageDraw.Draw(pil_mask)
-                for segment in segmentation:
-                    if len(segment) < 6:
-                        continue
-                    points = [(segment[i], segment[i + 1]) for i in range(0, len(segment), 2)]
-                    draw.polygon(points, outline=1, fill=1)
-                rle_mask = np.array(pil_mask, dtype='float32')
-            elif isinstance(segmentation, dict) and {'size', 'counts'} <= segmentation.keys():
-                rle_mask = self._decode_rle(segmentation, height, width)
-
-            if rle_mask is None:
-                continue
-
-            rle_mask = rle_mask.astype('float32')
-            mask[..., class_index] = np.maximum(mask[..., class_index], rle_mask)
-        return mask
-
-    @staticmethod
-    def _decode_rle(rle, height, width):
-        counts = rle.get('counts')
-        if isinstance(counts, list):
-            rle_counts = counts
-        else:
-            counts_bytes = counts.encode('ascii') if isinstance(counts, str) else counts
-            rle_counts = []
-            current = 0
-            shift = 0
-            for c in counts_bytes:
-                c = c - 48
-                current |= (c & 0x1F) << shift
-                if c & 0x20:
-                    shift += 5
-                else:
-                    rle_counts.append(current)
-                    current = 0
-                    shift = 0
-
-        decode_height, decode_width = rle.get('size', [height, width])
-        mask = np.zeros(decode_height * decode_width, dtype='float32')
-        index = 0
-        value = 0
-        for count in rle_counts:
-            if index + count > mask.size:
-                count = mask.size - index
-            if value == 1:
-                mask[index:index + count] = 1
-            index += count
-            value = 1 - value
-            if index >= mask.size:
-                break
-        decoded = mask.reshape((decode_height, decode_width), order='F')
-        if decoded.shape[0] != height or decoded.shape[1] != width:
-            padded = np.zeros((height, width), dtype='float32')
-            h = min(height, decoded.shape[0])
-            w = min(width, decoded.shape[1])
-            padded[:h, :w] = decoded[:h, :w]
-            decoded = padded
-        return decoded
 
 
 class Dataloder(keras.utils.Sequence):
@@ -353,7 +231,7 @@ class Dataloder(keras.utils.Sequence):
             self.indexes = np.random.permutation(self.indexes)
         #################
 # Lets look at data we have
-# dataset = Dataset(x_train_dir, annotations_file=y_train_annotations, classes=['defect', 'scratch'])
+# dataset = Dataset(x_train_dir, y_train_dir, classes=['defect', 'scratch'])
 
 # image, mask = dataset[0] # get some sample
 # visualize(
@@ -381,8 +259,7 @@ def get_training_augmentation():
 
         A.ShiftScaleRotate(scale_limit=0, rotate_limit=90, shift_limit=0.3, p=0.5, border_mode=cv2.BORDER_REFLECT),
 
-        A.PadIfNeeded(min_height=imsize, min_width=imsize, always_apply=True),
-        A.RandomCrop(height=imsize, width=imsize, always_apply=True),
+        A.PadIfNeeded(min_height=768, min_width=imsize, always_apply=True),
         # A.RandomCrop(height=192, width=192, always_apply=False),
 
         # A.IAAAdditiveGaussianNoise(p=0),
@@ -420,8 +297,7 @@ def get_training_augmentation():
 def get_validation_augmentation():
     """Add paddings to make image shape divisible by 32"""
     test_transform = [
-        A.PadIfNeeded(min_height=imsize, min_width=imsize, always_apply=True),
-        A.CenterCrop(height=imsize, width=imsize, always_apply=True),
+        A.PadIfNeeded(imsize, imsize),
         # A.augmentations.geometric.resize.LongestMaxSize(max_size=384, interpolation=cv2.INTER_AREA, always_apply=False,
         #                                                 p=1),
                                                     ]
@@ -446,14 +322,7 @@ def get_preprocessing(preprocessing_fn):
 #########
 
 # Lets look at augmented data we have
-# dataset = Dataset(x_train_dir, y_train_dir, classes=['defect', 'scratch'], augmentation=get_training_augmentation())
-dataset = Dataset(
-    x_train_dir,
-    classes=['defect', 'scratch'],
-    augmentation=get_training_augmentation(),
-    multiplier=3,
-    annotations_file=y_train_annotations,
-)
+dataset = Dataset(x_train_dir, y_train_dir, classes=['defect', 'scratch'], augmentation=get_training_augmentation(), multiplier=3)
 #
 # for i in range(len(dataset)):
 #     print(dataset[i][0].shape)
@@ -576,20 +445,20 @@ for backbon in bbns:
     # Dataset for train images
     train_dataset = Dataset(
         x_train_dir,
+        y_train_dir,
         classes=CLASSES,
         augmentation=get_training_augmentation(),
         preprocessing=get_preprocessing(preprocess_input),
-        multiplier=1,
-        annotations_file=y_train_annotations,
+        multiplier=1
     )
 
     # Dataset for validation images
     valid_dataset = Dataset(
         x_valid_dir,
+        y_valid_dir,
         classes=CLASSES,
         augmentation=get_validation_augmentation(),
         preprocessing=get_preprocessing(preprocess_input),
-        annotations_file=y_valid_annotations,
     )
 
     train_dataloader = Dataloder(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
@@ -667,10 +536,10 @@ if test_bool:
 
         test_dataset = Dataset(
             x_test_dir,
+            y_test_dir,
             classes=CLASSES,
             augmentation=get_validation_augmentation(),
             preprocessing=get_preprocessing(preprocess_input),
-            annotations_file=y_test_annotations,
         )
         test_dataset = Dataset(
             r"C:\Users\pawlowskj\Downloads\1_12_V&G_Euclid\1_12_V&G_Euclid\V&G_results",
